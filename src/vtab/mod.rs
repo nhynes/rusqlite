@@ -161,6 +161,38 @@ pub fn eponymous_only_module<T: VTab>() -> &'static Module<T> {
     }
 }
 
+pub fn updatable_eponymous_module<T: UpdateVTab>() -> &'static Module<T> {
+    &Module {
+        base: ffi::sqlite3_module {
+            iVersion: 2,
+            xCreate: None,
+            xConnect: Some(rust_connect::<T>),
+            xBestIndex: Some(rust_best_index::<T>),
+            xDisconnect: Some(rust_disconnect::<T>),
+            xDestroy: None,
+            xOpen: Some(rust_open::<T>),
+            xClose: Some(rust_close::<T::Cursor>),
+            xFilter: Some(rust_filter::<T::Cursor>),
+            xNext: Some(rust_next::<T::Cursor>),
+            xEof: Some(rust_eof::<T::Cursor>),
+            xColumn: Some(rust_column::<T::Cursor>),
+            xRowid: Some(rust_rowid::<T::Cursor>),
+            xUpdate: Some(rust_update::<T>),
+            xBegin: None,
+            xSync: None,
+            xCommit: None,
+            xRollback: None,
+            xFindFunction: None,
+            xRename: None,
+            xSavepoint: None,
+            xRelease: None,
+            xRollbackTo: None,
+            ..ZERO_MODULE
+        },
+        phantom: PhantomData::<T>,
+    }
+}
+
 /// `feature = "vtab"`
 pub struct VTabConnection(*mut ffi::sqlite3);
 
@@ -224,6 +256,38 @@ pub unsafe trait VTab: Sized {
     /// Create a new cursor used for accessing a virtual table.
     /// (See [SQLite doc](https://sqlite.org/vtab.html#the_xopen_method))
     fn open(&self) -> Result<Self::Cursor>;
+}
+
+pub unsafe trait UpdateVTab: VTab {
+    /// Inserts a new row and returns its `rowid`.
+    /// The returned `rowid` can be arbitrary if this is a `WITHOUT ROWID` table.
+    fn insert(&self, args: &Values) -> Result<i64>;
+
+    /// Inserts a row with a provided `primary_key`.
+    /// The default implementation is `insert`.
+    fn insert_with_rowid(&self, rowid: i64, args: &Values) -> Result<()> {
+        self.insert(args)?;
+        Ok(())
+    }
+
+    /// Updates the row with the specified `primary_key` (`rowid` for such tables).
+    fn update(&self, primary_key: ValueRef, args: &Values) -> Result<()>;
+
+    /// Deletes the row with the specified `primary_key` (`rowid` for such tables).
+    fn delete(&self, primary_key: ValueRef) -> Result<()>;
+
+    /// Like `update` but also changes the `PRIMARY KEY` (or `rowid`).
+    /// The default implementation is a `delete` followed by an `insert`.
+    fn update_with_primary_key(
+        &self,
+        primary_key: ValueRef,
+        new_primary_key: ValueRef,
+        args: &Values,
+    ) -> Result<()> {
+        self.delete(primary_key)?;
+        self.insert(args)?;
+        Ok(())
+    }
 }
 
 /// `feature = "vtab"` Non-eponymous virtual table instance trait.
@@ -962,6 +1026,57 @@ where
             ffi::SQLITE_OK
         }
         err => cursor_error(cursor, err),
+    }
+}
+
+unsafe extern "C" fn rust_update<T>(
+    vtab: *mut ffi::sqlite3_vtab,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+    p_rowid: *mut ffi::sqlite3_int64,
+) -> c_int
+where
+    T: UpdateVTab,
+{
+    let vt = &*(vtab as *mut T);
+
+    let args = slice::from_raw_parts_mut(argv, argc as usize);
+
+    let rowid = ValueRef::from_value(args[0]);
+
+    let result = if args.len() == 1 {
+        vt.delete(rowid)
+    } else {
+        let new_rowid = ValueRef::from_value(args[1]);
+        let values = &Values { args: &args[2..] };
+
+        if rowid == ValueRef::Null {
+            if new_rowid == ValueRef::Null {
+                vt.insert(values).map(|new_rowid| {
+                    *p_rowid = new_rowid;
+                })
+            } else {
+                vt.insert_with_rowid(new_rowid.as_i64().unwrap(), values)
+            }
+        } else if new_rowid == rowid {
+            vt.update(rowid, values)
+        } else {
+            vt.update_with_primary_key(rowid, new_rowid, values)
+        }
+    };
+
+    match result {
+        Ok(_) => ffi::SQLITE_OK,
+        Err(Error::SqliteFailure(err, s)) => {
+            if let Some(err_msg) = s {
+                set_err_msg(vtab, &err_msg);
+            }
+            err.extended_code
+        }
+        Err(err) => {
+            set_err_msg(vtab, &err.to_string());
+            ffi::SQLITE_ERROR
+        }
     }
 }
 

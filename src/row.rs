@@ -234,7 +234,8 @@ impl<'stmt> FallibleStreamingIterator for Rows<'stmt> {
 
 /// A single result row of a query.
 pub struct Row<'stmt> {
-    pub(crate) stmt: &'stmt Statement<'stmt>,
+    /// The statement that was executed to fetch this row.
+    pub stmt: &'stmt Statement<'stmt>,
 }
 
 impl<'stmt> Row<'stmt> {
